@@ -92,7 +92,12 @@ STEP_SECOND_REPLY = (
     "React briefly to what they said, then {next_action}"
 )
 
-NEXT_QUESTION = 'ask question {n} using its exact wording: "{q}"'
+# The second sentence matters: a question cut off by an interruption stays in
+# the context, and the LLM otherwise assumes it was asked and skips ahead.
+NEXT_QUESTION = (
+    'ask question {n} using its exact wording: "{q}" If you started asking it earlier and were cut off, '
+    "it has not been asked yet, so ask it in full now."
+)
 
 FEEDBACK = (
     "give your closing feedback now. In two or three short spoken sentences: name one real strength "
