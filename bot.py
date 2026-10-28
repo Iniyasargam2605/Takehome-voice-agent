@@ -59,6 +59,11 @@ SMART_TURN_STOP_SECS = float(os.getenv("SMART_TURN_STOP_SECS", "3.0"))
 # finished" verdict too (1.5 s cut people off mid "um..."), so keep it equal
 # to the Smart Turn fallback. Pipecat's default is 5 s.
 USER_TURN_STOP_TIMEOUT = float(os.getenv("USER_TURN_STOP_TIMEOUT", str(SMART_TURN_STOP_SECS)))
+# How long after the user stops we wait for the STT's final transcript before
+# ending the turn with whatever text we have. Pipecat assumes 0.35 s for
+# Deepgram; we measured 0.37-0.49 s on average, so the timer often fired
+# first and the last sentence of an answer landed in the next turn.
+STT_TTFS_P99_SECS = float(os.getenv("STT_TTFS_P99_SECS", "0.8"))
 
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
@@ -66,6 +71,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
     stt = DeepgramSTTService(
         api_key=os.environ["DEEPGRAM_API_KEY"],
+        ttfs_p99_latency=STT_TTFS_P99_SECS,
         settings=DeepgramSTTService.Settings(
             model=os.getenv("DEEPGRAM_MODEL", "nova-3-general"),
             smart_format=True,
