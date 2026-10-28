@@ -93,7 +93,6 @@ class LatencyObserver(BaseObserver):
         self._log = log
         self._turn: Turn | None = None
         self._bot_speaking = False
-        self._llm_requested = False
         self._seen: set[int] = set()
 
     async def on_push_frame(self, data: FramePushed):
@@ -131,19 +130,30 @@ class LatencyObserver(BaseObserver):
                 # the earlier fragment gets cancelled, so measure afresh.
                 self._turn.llm_request_ms = None
                 self._turn.llm_first_token_ms = None
-                self._llm_requested = False
-        elif isinstance(frame, VADUserStoppedSpeakingFrame) and self._turn:
+            return
+
+        # Until the reply starts playing, each field keeps its latest value,
+        # so it describes the attempt that was actually heard. Smart Turn can
+        # end a turn at a sentence break, and a late transcript can trigger a
+        # second LLM request, so earlier values may belong to cancelled work.
+        answering = self._turn is not None and self._turn.tts_first_audio_ms is None
+        if isinstance(frame, VADUserStoppedSpeakingFrame) and answering:
             self._turn.user_stopped_ms = self._log.ms(frame.timestamp - frame.stop_secs)
-        elif isinstance(frame, TranscriptionFrame) and self._turn and not self._llm_requested:
+        elif isinstance(frame, TranscriptionFrame) and answering:
             self._turn.stt_final_ms = self._log.ms(now)
-        elif isinstance(frame, LLMContextFrame) and self._turn:
-            self._llm_requested = True
+        elif isinstance(frame, LLMContextFrame) and answering:
             self._turn.llm_request_ms = self._log.ms(now)
-        elif isinstance(frame, LLMTextFrame) and self._turn and self._turn.llm_first_token_ms is None:
+            self._turn.llm_first_token_ms = None
+        elif (
+            isinstance(frame, LLMTextFrame)
+            and answering
+            and self._turn.llm_request_ms is not None
+            and self._turn.llm_first_token_ms is None
+        ):
             self._turn.llm_first_token_ms = self._log.ms(now)
         elif isinstance(frame, BotStartedSpeakingFrame):
             self._bot_speaking = True
-            if self._turn and self._turn.tts_first_audio_ms is None and self._llm_requested:
+            if answering and self._turn.llm_first_token_ms is not None:
                 self._turn.tts_first_audio_ms = self._log.ms(now)
         elif isinstance(frame, BotStoppedSpeakingFrame):
             self._bot_speaking = False
@@ -152,7 +162,6 @@ class LatencyObserver(BaseObserver):
         if self._turn and self._turn.user_stopped_ms is not None:
             self._log.write_turn(self._turn)
         self._turn = None
-        self._llm_requested = False
 
     def finish(self):
         """Write the last turn and the summary at session end."""
