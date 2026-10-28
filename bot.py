@@ -31,6 +31,7 @@ from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.groq.llm import GroqLLMService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
+from pipecat.turns.user_start.vad_user_turn_start_strategy import VADUserTurnStartStrategy
 from pipecat.turns.user_stop.turn_analyzer_user_turn_stop_strategy import (
     TurnAnalyzerUserTurnStopStrategy,
 )
@@ -53,6 +54,11 @@ VAD_CONFIDENCE = float(os.getenv("VAD_CONFIDENCE", "0.7"))
 # Smart Turn fallback: if the model keeps saying "not finished", end the turn
 # anyway after this much silence. Interview answers have thinking pauses.
 SMART_TURN_STOP_SECS = float(os.getenv("SMART_TURN_STOP_SECS", "3.0"))
+# Inactivity safety net: a user turn with no voice or transcript activity for
+# this long ends regardless of Smart Turn. It overrides Smart Turn's "not
+# finished" verdict too (1.5 s cut people off mid "um..."), so keep it equal
+# to the Smart Turn fallback. Pipecat's default is 5 s.
+USER_TURN_STOP_TIMEOUT = float(os.getenv("USER_TURN_STOP_TIMEOUT", str(SMART_TURN_STOP_SECS)))
 
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
@@ -96,6 +102,10 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
                 )
             ),
             user_turn_strategies=UserTurnStrategies(
+                # VAD only. The default also starts a turn on any transcript,
+                # so a late transcript of speech that had already ended the
+                # turn would interrupt the bot's reply and open an empty turn.
+                start=[VADUserTurnStartStrategy()],
                 stop=[
                     TurnAnalyzerUserTurnStopStrategy(
                         turn_analyzer=LocalSmartTurnAnalyzerV3(
@@ -104,6 +114,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
                     )
                 ]
             ),
+            user_turn_stop_timeout=USER_TURN_STOP_TIMEOUT,
         ),
     )
 
