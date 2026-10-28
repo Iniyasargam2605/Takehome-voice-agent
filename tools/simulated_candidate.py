@@ -204,7 +204,10 @@ async def main():
             if CLOSING in coach.lower():
                 break
             history.append({"role": "user", "content": coach})
-            reply = await candidate_reply(http, history)
+            # One line, so TTS doesn't insert a paragraph-length pause.
+            reply = " ".join((await candidate_reply(http, history)).split())
+            # Plain punctuation; Unicode dashes made the TTS pause oddly.
+            reply = re.sub("[\u2010-\u2015]", "-", reply).replace("\u2019", "'")
             history.append({"role": "assistant", "content": reply})
 
             if turn == 1:
@@ -224,16 +227,18 @@ async def main():
                 await asyncio.wait_for(ear.started.wait(), 20)
             except asyncio.TimeoutError:
                 print("  !! coach did not reply within 20 s")
-                results["turns"].append({"turn": turn, "client_gap_ms": None})
+                results["turns"].append({"turn": turn, "said": reply, "client_gap_ms": None})
                 continue
             gap = round((ear.started_at - user_end) * 1000)
-            results["turns"].append({"turn": turn, "client_gap_ms": gap})
+            results["turns"].append({"turn": turn, "said": reply, "client_gap_ms": gap})
             print(f"  client-side gap, candidate stopped -> coach audio: {gap} ms")
 
             if turn == 3:
                 # Scenario C: talk over the coach 1.5 s into its reply.
                 await asyncio.sleep(1.5)
-                if ear.speaking:
+                # ear.speaking lags real silence by SILENCE_DONE_SECS, so check
+                # that coach audio is actually arriving right now.
+                if ear.speaking and time.time() - ear.last_voice < 0.3:
                     interjection = "Sorry, quick question, should I focus on the technical side or the business side?"
                     print(f"CANDIDATE (C, interrupting): {interjection}")
                     history.append({"role": "assistant", "content": interjection})
