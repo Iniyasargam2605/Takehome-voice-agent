@@ -29,6 +29,8 @@ Each session writes to `sessions/<timestamp>/`: `latency.jsonl`, `transcript.txt
 
 **Automated test session:** with the bot running, `python tools/simulated_candidate.py` connects over WebRTC like a browser. It acts as a candidate (answers from Groq, voice from Cartesia) and plays out scenarios A, B and C, measuring reply gaps and interruption stop time on the client side.
 
+**Tests:** `python -m unittest discover -s tests -v` runs 11 offline regression tests for the bugs below (no API keys or network needed); 7 of them fail on the code before the fixes. After a simulated session, `python tests/check_session.py` checks the newest `sessions/` folder and `bot.log` against each fix: questions in order, follow-ups, scenarios B and C, no phantom turns, latency rows, and that the coach never replied mid-answer.
+
 **Windows note:** Pipecat has some long file paths. If you get `ModuleNotFoundError` for a module that exists on disk, your project or venv path is over Windows' 260-character limit. Move the venv somewhere short such as `C:\venvs\trainertwin`.
 
 ## Architecture
@@ -86,15 +88,17 @@ Custom pieces:
 | Smart Turn `stop_secs` (fallback) | 3.0 | 3.0 (`SMART_TURN_STOP_SECS`) | If Smart Turn keeps saying "not finished", the turn ends anyway after this much silence. People pause to think in interviews, so I kept it long. |
 | `user_turn_stop_timeout` | 5.0 | 3.0 (`USER_TURN_STOP_TIMEOUT`) | An inactivity timer: with no voice or transcript activity for this long, the turn ends regardless of Smart Turn. 5 s meant 5 s of dead air in the failure below. 1.5 s cut people off mid "um…". It now matches the Smart Turn fallback. |
 | Turn start | VAD **or** transcript | **VAD only** | See "what went wrong" below. This was the biggest latency fix. |
+| STT final-transcript wait (`ttfs_p99_latency`) | 0.35 (Deepgram) | 0.8 (`STT_TTFS_P99_SECS`) | How long after the user stops Pipecat waits for the final transcript before ending the turn with the text it has. Deepgram took longer than 0.35 s here; see item 4 below. |
 | VAD `start_secs` | 0.2 | 0.2 | How long the user must speak before it counts as speech and interrupts the bot. 0.2 s stops the bot quickly in scenario C. |
 | VAD `confidence` | 0.7 | 0.7 | Left at default. |
 | Interruptions | on | on | Voice detected while the bot speaks interrupts it. Pipecat cancels the LLM and TTS work in progress and drops queued audio. Cartesia's word timestamps mean the context keeps only the words that were actually played. The system prompt tells the LLM to respond to what the user said, then carry on from the current step. |
 
-**What went wrong before I changed these.** I found these with the simulated candidate, over four full sessions:
+**What went wrong before I changed these.** I found these with the simulated candidate, over seven sessions:
 
 1. **Phantom interruptions, 5–6 s replies.** Two of five turns took over 6 s (p95 6.35 s). In the log, Smart Turn correctly ended the turn and the bot started replying. Then a late final transcript of the same speech arrived, and Pipecat's default `TranscriptionUserTurnStartStrategy` treated it as the user speaking again. That interrupted the reply and opened an empty user turn, which waited for the 5 s `user_turn_stop_timeout` ("Empty user turn (interrupted), running LLM"). **Fix:** start turns from the VAD only. Real interruptions still come from the VAD. After the fix there were zero empty turns, and p95 fell to 1.48 s.
 2. **Over-tight timeout broke scenario B.** As a first fix for item 1, I lowered `user_turn_stop_timeout` to 1.5 s. The coach then cut in during the 2 s "um…" pause ("Take your time…"), because this timer overrides Smart Turn's "incomplete" verdict. **Fix:** set it back to 3 s, matching Smart Turn's fallback.
 3. **Sentence breaks end turns.** Smart Turn sometimes declares a turn complete at the end of a sentence even though the speaker continues. When they continue, the reply in progress is cancelled, so this costs nothing audible. But the interview director had counted each fragment as a separate reply, so follow-ups were never allowed. **Fix:** in `interview.py`, user messages in a row count as one reply.
+4. **The coach replied before hearing the last sentence.** In every answer, the last sentence showed up in the transcript after the coach's reply, as the start of the next turn. Pipecat budgets 0.35 s (`ttfs_p99_latency`) for Deepgram's final transcript; here it took 0.37–0.49 s on average. When the budget ran out first, the turn ended with only the text received so far. **Fix:** raise the budget to 0.8 s. In the next run, `tests/check_session.py` found no answer split across a coach reply (7 of 7), with replies still about 1.4 s.
 
 ## Latency
 
@@ -109,7 +113,7 @@ How each field in `latency.jsonl` is captured (timestamps are ms since the sessi
 
 If Smart Turn ends a turn early and the user carries on, the LLM request for the fragment is cancelled. Each field therefore keeps its latest value before the reply starts playing, so a row describes the attempt that was actually heard.
 
-**Simulated-candidate session** (final settings, 5 turns; local `sessions/` logs are not committed):
+**Simulated-candidate session** (5 turns, before the STT budget change in item 4; local `sessions/` logs are not committed). A full rerun with every fix was cut short when the Cartesia free credit ran out (HTTP 402); the part that ran replied in about 1.4 s.
 
 | | ms |
 |---|---|
@@ -136,7 +140,7 @@ Where the time goes: about 0.2 s is the VAD silence wait (part of the 490 ms bef
 ## Stretch
 
 - **Eval:** `eval_transcript.py` scores a transcript for question order, grounded reactions, follow-up judgement, feedback specificity and voice style (1–5 each).
-- **Simulated candidate:** `tools/simulated_candidate.py` replays scenarios A, B and C end to end over WebRTC. It found every bug listed above.
+- **Simulated candidate:** `tools/simulated_candidate.py` replays scenarios A, B and C end to end over WebRTC. It found every bug listed above, and `tests/test_fixes.py` pins each one down.
 - **Persona:** "Maya" is warm but honest; the persona and rules are in `PROMPTS.md`.
 
 ## AI tools

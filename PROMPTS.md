@@ -58,7 +58,7 @@ You asked question {n} and already used your one follow-up or nudge. Do not ask 
 
 `{next_action}` is either the next question:
 ```text
-ask question {n} using its exact wording: "{q}"
+ask question {n} using its exact wording: "{q}" If you started asking it earlier and were cut off, it has not been asked yet, so ask it in full now.
 ```
 or, after question 4, the feedback prompt:
 ```text
@@ -128,6 +128,20 @@ Result: the coach answers and returns to the question it was on:
 [133.72s] Coach: Nice, a solid 96 percent. What would you do differently [interrupted by user]
 [138.37s] User: ... Sorry. Quick question.
 [142.40s] Coach: Sure, what's your quick question? What would you do differently now?
+```
+
+**v4: say outright that a cut-off question has not been asked.**
+What went wrong in v3: the director correctly said "ask question 3", but the LLM saw its own half-asked question 3 in the history and moved on to question 4, so question 3 was never answered:
+```text
+[115.92s] Coach: Got it, latency was a key concern. How did you know it was working [interrupted by user]
+[120.20s] User: settlement file end to end in under five hundred milliseconds ...
+[124.62s] Coach: Impressive numbers. What would you do differently now?
+```
+Fix: the next-question instruction now ends "If you started asking it earlier and were cut off, it has not been asked yet, so ask it in full now." In the next run, the coach was cut off during a follow-up, answered the candidate's interjection, then asked question 3 in full:
+```text
+[112.46s] Coach: Got it. How many bank file formats did you end up supporting [interrupted by user]
+[117.39s] User: Sorry. Quick question. I focus on the technical side or the business side?
+[124.29s] Coach: You can highlight both, but lead with the technical challenges since they showcase your problem-solving. How did you know it was working well?
 ```
 
 ## Known failure cases
