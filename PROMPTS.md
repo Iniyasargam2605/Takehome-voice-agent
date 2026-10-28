@@ -47,6 +47,7 @@ The session is starting. Greet the candidate in one short sentence, say this is 
 You asked question {n}. The candidate has just answered it. Decide:
 - If the answer was vague, very short, or missing a concrete detail, ask ONE short follow-up about it.
 - If the answer was empty, off topic, or they said they don't know, give ONE gentle nudge.
+- If they asked you something instead of answering, answer it in one sentence, then ask question {n} again.
 - Otherwise, react briefly to what they said and move on: {next_action}
 ```
 
@@ -73,7 +74,12 @@ The interview is over and you already gave feedback. Reply in one sentence to wh
 
 The decision is split between code and the LLM:
 
-- **Code decides where we are and what is allowed.** `current_step()` scans the conversation. The last agent message containing a question's exact wording sets the current question. Then it counts user replies since that question was asked. One reply means the LLM may use its single follow-up or nudge, or move on. Two or more means it must move on. So order is fixed and follow-ups are capped at one per question, whatever the LLM "wants".
+- **Code decides where we are and what is allowed.** `current_step()` scans the conversation:
+  - The last agent message containing the end of a question's exact wording ("…do differently now") sets the current question. A question cut off by an interruption doesn't count. A question asked again resets the count.
+  - Then it counts user replies since that question was asked. Several user messages in a row count as one reply, because Smart Turn can split one answer at sentence breaks.
+  - One reply means the LLM may use its single follow-up or nudge, or move on. Two or more means it must move on.
+
+  So order is fixed and follow-ups are capped at one per question, whatever the LLM "wants".
 - **The LLM decides the judgement call.** It chooses whether this answer needs a follow-up (vague or missing detail), a nudge (empty, off topic, "I don't know"), or no further question, using the criteria in the first-reply step.
 - The closing line "That's the end of our practice session." is a fixed phrase, so code can tell that feedback was given. After it is spoken without an interruption, the director ends the session.
 
@@ -92,17 +98,40 @@ When the director sees that question 4 has been answered (and its follow-up used
 
 ## Iterations
 
-> TODO: replace this section with your own real iterations and pasted examples from your sessions. Do not keep invented examples. Below is the change made while building, and the shape to follow.
+From the start, the design was code-tracked state plus a per-reply step instruction, rather than one static prompt where the LLM tracks progress itself. The iterations below come from sessions with the simulated candidate (`tools/simulated_candidate.py`). The excerpts are copied from `transcript.txt` and the bot log.
 
-**v1: one static system prompt, the LLM tracks the interview itself.** All four questions and the rules ("one follow-up at most, then move on") were in the prompt, with no state from code.
-What went wrong: TODO, paste a short transcript excerpt. Typical failures to look for: asking two follow-ups on the same question, skipping question 3 after a long answer to question 2, or merging two questions into one turn.
+**v1: count every user message as a reply; match short question phrases.**
+What went wrong: Smart Turn split one long answer into several user messages, so after the first answer the director already said the follow-up was used up. A cut-off question 4 was counted as asked, the interjection counted as its answer, and the coach went straight to feedback. Question 4 was never answered:
+```text
+[ 41.85s] User: So I worked on sure. At my last FinTech startup, I built a payments reconciliation service ...
+[ 54.01s] User: I designed a flexible matching engine that handles partial matches, ...
+  (step: "You asked question 1 and already used your one follow-up or nudge ...")
+[138.06s] Coach: Great numbers and reliable alerts. What would you do differently [interrupted by user]
+[142.68s] User: Sorry.
+[142.94s] User: Quick question. Should I focus on the technical side or the business side?
+[165.18s] Coach: Both are valuable, but leading with the technical impact ... That's the end of our practice session.
+```
 
-**v2: `InterviewDirector` injects the current step.** Code works out the question and the follow-up count from the conversation and gives the LLM one instruction for this reply only. Result: TODO, what changed in your sessions.
+**v2: merge consecutive user messages into one reply; match on the end of each question.**
+Result: real follow-ups appeared ("How many transactions did the service handle each day?"), and a cut-off question no longer counted. New problem: when the candidate replied to a fully asked question with a question of their own, the LLM answered it and moved on, so question 3 was skipped:
+```text
+[115.16s] Coach: Nice speed. How did you know it was working well?
+[117.71s] User: Sorry.
+[120.67s] User: Quick question.
+[120.94s] User: Should I focus on the technical side or the business side?
+[127.54s] Coach: Both are valuable, but highlighting the business impact shows why the technical work mattered. What would you do differently now?
+```
 
-**v3 (if any):** TODO, for example tightening the feedback prompt to require a quote after feedback came out generic.
+**v3: tell the LLM to answer a question from the candidate in one sentence and then re-ask; a re-asked question resets the follow-up count.**
+Result: the coach answers and returns to the question it was on:
+```text
+[133.72s] Coach: Nice, a solid 96 percent. What would you do differently [interrupted by user]
+[138.37s] User: ... Sorry. Quick question.
+[142.40s] Coach: Sure, what's your quick question? What would you do differently now?
+```
 
 ## Known failure cases
 
 1. **Paraphrased question → asked twice.** Detection relies on the exact question wording. If the LLM rephrases ("What's a project you're really proud of?"), the director thinks question 1 was never asked and tells the LLM to ask it again.
-2. **Follow-up that sounds like a later question.** A follow-up on question 2 such as "How did you know it was working?" matches question 3's wording, so the director skips ahead and question 3 is never asked as such.
-3. TODO: anything you saw live, for example the closing line being cut off by an interruption, or a backchannel "mm-hmm" interrupting the agent.
+2. **Follow-up that sounds like a later question.** A follow-up on question 2 ending "…how did you know it was working well?" matches question 3's wording, so the director skips ahead and question 3 is never asked as such.
+3. **A question split by a sentence-break turn end.** In v3's run, Smart Turn ended the turn after "Sorry. Quick question.", before the actual question. The coach replied "Sure, what's your quick question?" and asked question 4 in the same breath. The candidate's real question then arrived merged with their answer, and the coach never answered it.
