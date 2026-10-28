@@ -33,12 +33,13 @@ QUESTIONS = [
 ]
 
 # Phrases used to spot which question an agent message asked. The prompt tells
-# the LLM to use the exact wording, so these are deliberately short.
+# the LLM to use the exact wording. Each phrase runs to the end of the
+# question, so a question cut off by an interruption doesn't count as asked.
 QUESTION_SIGNATURES = [
     ("project you're proud of", "project you are proud of"),
-    ("hardest technical problem",),
-    ("know it was working well", "know it was working"),
-    ("do differently now", "would you do differently"),
+    ("hardest technical problem in it",),
+    ("know it was working well",),
+    ("do differently now",),
 ]
 
 CLOSING_LINE = "That's the end of our practice session."
@@ -81,6 +82,8 @@ STEP_FIRST_REPLY = (
     "You asked question {n}. The candidate has just answered it. Decide:\n"
     "- If the answer was vague, very short, or missing a concrete detail, ask ONE short follow-up about it.\n"
     "- If the answer was empty, off topic, or they said they don't know, give ONE gentle nudge.\n"
+    "- If they asked you something instead of answering, answer it in one sentence, then ask question "
+    "{n} again.\n"
     "- Otherwise, react briefly to what they said and move on: {next_action}"
 )
 
@@ -123,6 +126,7 @@ def current_step(messages: list[dict]) -> str:
     question = 0
     replies_since_question = 0
     feedback_given = False
+    previous_role = None
     for m in messages:
         role = m.get("role")
         content = m.get("content")
@@ -132,11 +136,18 @@ def current_step(messages: list[dict]) -> str:
             if CLOSING_LINE.lower().rstrip(".") in _normalise(content):
                 feedback_given = True
             n = asked_question(content)
-            if n and n > question:
+            # >= so a re-asked question (after the user asked something
+            # instead of answering) gets a fresh follow-up allowance.
+            if n and n >= question:
                 question = n
                 replies_since_question = 0
-        elif role == "user":
+        elif role == "user" and previous_role != "user":
+            # Smart Turn can end a turn at a sentence break and the user then
+            # carries on, leaving several user messages in a row. That's still
+            # one reply.
             replies_since_question += 1
+        if role in ("user", "assistant") and (role == "user" or content.strip()):
+            previous_role = role
 
     if feedback_given:
         return STEP_AFTER_FEEDBACK
