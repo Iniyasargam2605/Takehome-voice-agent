@@ -29,7 +29,7 @@ Each session writes to `sessions/<timestamp>/`: `latency.jsonl`, `transcript.txt
 
 **Automated test session:** with the bot running, `python tools/simulated_candidate.py` connects over WebRTC like a browser. It acts as a candidate (answers from Groq, voice from Cartesia) and plays out scenarios A, B and C, measuring reply gaps and interruption stop time on the client side.
 
-**Tests:** `python -m unittest discover -s tests -v` runs 11 offline regression tests for the bugs below (no API keys or network needed); 7 of them fail on the code before the fixes. After a simulated session, `python tests/check_session.py` checks the newest `sessions/` folder and `bot.log` against each fix: questions in order, follow-ups, scenarios B and C, no phantom turns, latency rows, and that the coach never replied mid-answer.
+**Tests:** `python -m unittest discover -s tests -v` runs 15 offline regression tests for the bugs below (no API keys or network needed). After a simulated session, `python tests/check_session.py` checks the newest `sessions/` folder and `bot.log` against each fix: questions in order, follow-ups, scenarios B and C, no phantom turns, latency rows, and that the coach never replied mid-answer.
 
 **Windows note:** Pipecat has some long file paths. If you get `ModuleNotFoundError` for a module that exists on disk, your project or venv path is over Windows' 260-character limit. Move the venv somewhere short such as `C:\venvs\trainertwin`.
 
@@ -69,6 +69,7 @@ Custom pieces:
 
   It then puts one instruction into the system prompt: ask question 1; or "decide: one follow-up, one nudge, or move on to question N+1"; or "follow-up already used, move on now"; or "give the closing feedback". The LLM never has to track state itself, and follow-ups are capped at one per question. I avoided a tool call, which would add a second LLM round trip. After the closing line has been spoken, and the user hasn't interrupted, it waits 1.5 s and ends the session.
 - **`session_log.py` → `LatencyObserver`** (a pipeline observer) builds one row per user turn and writes the summary. See the latency section.
+- **`turn_end.py`**: a Deepgram STT subclass and a Smart Turn stop strategy subclass that end the turn as soon as Deepgram confirms the transcript is complete (item 5 under turn-taking).
 - **`tools/simulated_candidate.py`**: a test client, described above.
 
 ## Providers and why
@@ -79,6 +80,8 @@ Custom pieces:
 | LLM | Groq `openai/gpt-oss-120b`, reasoning effort low | Time-to-first-token about 0.4–0.8 s on Groq (measured mean 566 ms), and it follows the step instruction reliably. Pipecat 1.14's default Groq model. | Reasoning tokens add some delay before the first spoken token; free-tier rate limits |
 | TTS | Cartesia sonic | First audio about 150 ms after the first LLM token (measured), natural voice, word timestamps (so interrupted turns store only what was actually spoken) | Smaller voice catalogue than ElevenLabs |
 
+**Fallback TTS:** set `TTS_PROVIDER=deepgram` in `.env` to use Deepgram Aura-2 (`aura-2-thalia-en`) with the Deepgram key instead of Cartesia; the simulated candidate follows the same setting. It has no word timestamps, so an interrupted reply stays in context as whole sentences. In simulated sessions it added about 230 ms (first audio ~380 ms after the first token, against ~150 ms for Cartesia); with the item 5 fix, p50 was 1729 ms and p95 1756 ms over 5 turns. A worse problem: when a reply is cancelled before any audio plays (the candidate resumes after a pause), Pipecat still stores the whole unplayed text in the context. In one run that put an unheard "What would you do differently now?" in the history, so the director counted question 4 as asked. Cartesia stores only words actually played, so use it for real sessions.
+
 ## Turn-taking and interruptions
 
 | Setting | Pipecat default | Mine | Why |
@@ -88,7 +91,7 @@ Custom pieces:
 | Smart Turn `stop_secs` (fallback) | 3.0 | 3.0 (`SMART_TURN_STOP_SECS`) | If Smart Turn keeps saying "not finished", the turn ends anyway after this much silence. People pause to think in interviews, so I kept it long. |
 | `user_turn_stop_timeout` | 5.0 | 3.0 (`USER_TURN_STOP_TIMEOUT`) | An inactivity timer: with no voice or transcript activity for this long, the turn ends regardless of Smart Turn. 5 s meant 5 s of dead air in the failure below. 1.5 s cut people off mid "um…". It now matches the Smart Turn fallback. |
 | Turn start | VAD **or** transcript | **VAD only** | See "what went wrong" below. This was the biggest latency fix. |
-| STT final-transcript wait (`ttfs_p99_latency`) | 0.35 (Deepgram) | 0.8 (`STT_TTFS_P99_SECS`) | How long after the user stops Pipecat waits for the final transcript before ending the turn with the text it has. Deepgram took longer than 0.35 s here; see item 4 below. |
+| STT final-transcript wait (`ttfs_p99_latency`) | 0.35 (Deepgram) | 0.8 (`STT_TTFS_P99_SECS`) | How long after the user stops Pipecat waits for the final transcript before ending the turn with the text it has. Deepgram took longer than 0.35 s here; see items 4 and 5 below. Normally the turn ends well before this. |
 | VAD `start_secs` | 0.2 | 0.2 | How long the user must speak before it counts as speech and interrupts the bot. 0.2 s stops the bot quickly in scenario C. |
 | VAD `confidence` | 0.7 | 0.7 | Left at default. |
 | Interruptions | on | on | Voice detected while the bot speaks interrupts it. Pipecat cancels the LLM and TTS work in progress and drops queued audio. Cartesia's word timestamps mean the context keeps only the words that were actually played. The system prompt tells the LLM to respond to what the user said, then carry on from the current step. |
@@ -99,6 +102,7 @@ Custom pieces:
 2. **Over-tight timeout broke scenario B.** As a first fix for item 1, I lowered `user_turn_stop_timeout` to 1.5 s. The coach then cut in during the 2 s "um…" pause ("Take your time…"), because this timer overrides Smart Turn's "incomplete" verdict. **Fix:** set it back to 3 s, matching Smart Turn's fallback.
 3. **Sentence breaks end turns.** Smart Turn sometimes declares a turn complete at the end of a sentence even though the speaker continues. When they continue, the reply in progress is cancelled, so this costs nothing audible. But the interview director had counted each fragment as a separate reply, so follow-ups were never allowed. **Fix:** in `interview.py`, user messages in a row count as one reply.
 4. **The coach replied before hearing the last sentence.** In every answer, the last sentence showed up in the transcript after the coach's reply, as the start of the next turn. Pipecat budgets 0.35 s (`ttfs_p99_latency`) for Deepgram's final transcript; here it took 0.37–0.49 s on average. When the budget ran out first, the turn ended with only the text received so far. **Fix:** raise the budget to 0.8 s. In the next run, `tests/check_session.py` found no answer split across a coach reply (7 of 7), with replies still about 1.4 s.
+5. **Every turn then waited the full 0.8 s.** Pipecat ends a turn early when the STT marks a transcript as finalized. On VAD stop it asks Deepgram to finalize, but Deepgram has usually already sent the whole utterance, so its finalize reply is empty and nothing is ever marked finalized. The turn-end wait went from 27 ms to 374 ms on average. **Fix:** `turn_end.py` passes that empty confirmation on as a marker frame, and a Smart Turn strategy subclass treats it like a finalized transcript (only after the VAD stop, with text in hand). The wait fell to 50 ms; the 0.8 s budget is still the safety net.
 
 ## Latency
 
