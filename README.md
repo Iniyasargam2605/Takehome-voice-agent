@@ -29,7 +29,7 @@ Each session writes to `sessions/<timestamp>/`: `latency.jsonl`, `transcript.txt
 
 **Automated test session:** with the bot running, `python tools/simulated_candidate.py` connects over WebRTC like a browser. It acts as a candidate (answers from Groq, voice from Cartesia) and plays out scenarios A, B and C, measuring reply gaps and interruption stop time on the client side.
 
-**Tests:** `python -m unittest discover -s tests -v` runs 15 offline regression tests for the bugs below (no API keys or network needed). After a simulated session, `python tests/check_session.py` checks the newest `sessions/` folder and `bot.log` against each fix: questions in order, follow-ups, scenarios B and C, no phantom turns, latency rows, and that the coach never replied mid-answer.
+**Tests:** `python -m unittest discover -s tests -v` runs 27 offline regression tests for the bugs below and the intent-tag state machine (no API keys or network needed). After a simulated session, `python tests/check_session.py` checks the newest `sessions/` folder and `bot.log` against each fix: questions in order, follow-ups, scenarios B and C, no phantom turns, latency rows, and that the coach never replied mid-answer.
 
 **Windows note:** Pipecat has some long file paths. If you get `ModuleNotFoundError` for a module that exists on disk, your project or venv path is over Windows' 260-character limit. Move the venv somewhere short such as `C:\venvs\trainertwin`.
 
@@ -47,7 +47,9 @@ browser mic ──WebRTC──▶ transport.input()
                      InterviewDirector  (custom)            rewrites the system prompt's
                           │                                 "current step" before each LLM call
                           ▼
-                     Groq LLM (gpt-oss-120b, streaming)     → LLMTextFrame
+                     Groq LLM (gpt-oss-120b, streaming)     → LLMTextFrame, starting with an intent tag
+                          ▼
+                     ReplyTagFilter  (custom)               strips the tag, reports it once audio plays
                           ▼
                      Cartesia TTS (sonic, websocket)        → audio frames
                           ▼
@@ -63,11 +65,17 @@ Transport: Pipecat's `SmallWebRTCTransport` with its prebuilt browser UI, run by
 
 Custom pieces:
 
-- **`interview.py` → `InterviewDirector`** (a `FrameProcessor`). Before every LLM call it reads the conversation so far and works out the state:
-  - which of the four questions was last asked, matched on the end of the question's exact wording, so a question cut off by an interruption doesn't count
-  - how many replies the user has given since then, where several user messages in a row count as one reply
-
-  It then puts one instruction into the system prompt: ask question 1; or "decide: one follow-up, one nudge, or move on to question N+1"; or "follow-up already used, move on now"; or "give the closing feedback". The LLM never has to track state itself, and follow-ups are capped at one per question. I avoided a tool call, which would add a second LLM round trip. After the closing line has been spoken, and the user hasn't interrupted, it waits 1.5 s and ends the session.
+- **`interview.py`: the LLM classifies, Python enforces.**
+  - **The LLM** starts each reply with a tag saying what the candidate's turn was: `answer`, `repeat`, `question`, `unclear`, `off_topic` or `skip`. This handles any wording of "can you repeat that?", which a keyword list can't. It comes in the same call as the reply, so it adds no round trip.
+  - **`ReplyTagFilter`**, between the LLM and TTS, strips the tag so it's never spoken. Once the reply starts playing, it hands the tag to the director.
+  - **`InterviewDirector`**, before the LLM, writes that tag back onto the reply in the context. It then derives the state from the agent's messages in plain Python:
+    - which of the four questions was last asked, matched on the end of the question's exact wording, so a question cut off by an interruption doesn't count
+    - whether that question's one follow-up or nudge has been used (only `answer`/`skip` replies count)
+    - how many repeats or clarifications there have been (capped at two, then it moves on)
+  - **The step instruction** offers the LLM only the branches allowed now, with the last question spelled out for repeats.
+  - **Ending:** after the closing line has been spoken, and the user hasn't interrupted, the director waits 1.5 s and ends the session.
+  - **Why not Pipecat Flows** (built into Pipecat 1.14 as `pipecat.flows`): its function calls run the LLM a second time before the agent speaks, which would add a round trip to most replies.
+  - **Why not a separate classifier model:** it would add 150–300 ms to every turn.
 - **`session_log.py` → `LatencyObserver`** (a pipeline observer) builds one row per user turn and writes the summary. See the latency section.
 - **`turn_end.py`**: a Deepgram STT subclass and a Smart Turn stop strategy subclass that end the turn as soon as Deepgram confirms the transcript is complete (item 5 under turn-taking).
 - **`tools/simulated_candidate.py`**: a test client, described above.
@@ -134,8 +142,9 @@ Where the time goes: about 0.2 s is the VAD silence wait (part of the 490 ms bef
 
 ## What's weak and what I'd do next
 
-- **Question tracking matches on exact wording.** If the LLM paraphrases a question, the director thinks it hasn't been asked and asks it again. A follow-up that ends with a later question's words ("…how did you know it was working well?") counts as that question. Next: have the LLM emit a short hidden tag that is stripped before TTS, or use a tool call off the latency path.
-- **An interruption right after a question is asked can cost that question its follow-up.** The interjection counts as the reply, the coach answers it and asks the question again, and the real answer can then get a fresh follow-up. But if the coach doesn't repeat the question word for word, the interjection uses up the allowance.
+- **Question tracking matches on exact wording.** If the LLM paraphrases a question, the director thinks it hasn't been asked and asks it again. A follow-up that ends with a later question's words ("…how did you know it was working well?") counts as that question. Next: tag the question number as well as the intent.
+- **The LLM sometimes leaves out the intent tag.** It happened in 1 reply of 7 in the simulated run. An untagged reply counts as an answer, so the coach moves on one turn early but never loops. A reply interrupted while playing can also lose its tag. The tags and the extra prompt text cost a little latency; p50 in that run was 1.9 s vs 1.73 s before, though Groq's first-token time varies between runs.
+- **Smart Turn hears a spoken question as unfinished.** "Could you say it again?" was judged incomplete in both simulated runs, so the reply waited for the 3 s fallback (about 4.2 s in total). This is probably the rising intonation. Next: let a transcript ending in "?" shorten the fallback.
 - **Sentence-break turn ends waste LLM calls.** Smart Turn sometimes ends a turn at a sentence break and the request gets cancelled. That's invisible to the user, but it costs tokens and, for a speaker who pauses ~1 s between sentences, risks a reply starting too early. Next: wait for confirmation from a second signal (an LLM completeness check, `FilterIncompleteUserTurnStrategies`) only on long answers.
 - **The closing feedback isn't checked against a rubric while the session runs.**
 - **The simulated candidate is cleaner than a person.** Its pauses are synthetic, and it interrupts at a fixed 1.5 s into the reply.
