@@ -4,7 +4,7 @@ Start the bot first (python bot.py), then:
     python tools/simulated_candidate.py
 
 The candidate's answers come from a Groq LLM playing an engineer, voiced by
-Cartesia. It acts out the three scenarios from the brief:
+Cartesia (or Deepgram when TTS_PROVIDER=deepgram). It acts out the three scenarios from the brief:
     A: normal answers
     B: first answer has a mid-sentence pause ("I worked on... um... <2 s> payments")
     C: on the third answer it talks over the coach's reply
@@ -35,6 +35,8 @@ load_dotenv(override=True)
 
 BOT_URL = os.getenv("SIM_BOT_URL", "http://localhost:7860")
 VOICE_ID = os.getenv("SIM_VOICE_ID", "47c38ca4-5f35-497b-b1a3-415245fb35e1")
+# Used instead of Cartesia when TTS_PROVIDER=deepgram, like the bot.
+SIM_DEEPGRAM_VOICE = os.getenv("SIM_DEEPGRAM_VOICE", "aura-2-orion-en")
 SAMPLE_RATE = 16000
 CHUNK = SAMPLE_RATE // 50  # 20 ms
 SPEECH_RMS = 300  # int16 RMS above this counts as the coach speaking
@@ -126,6 +128,15 @@ class CoachEar:
 
 
 async def tts(session: aiohttp.ClientSession, text: str) -> bytes:
+    if os.getenv("TTS_PROVIDER", "cartesia").lower() == "deepgram":
+        async with session.post(
+            "https://api.deepgram.com/v1/speak",
+            params={"model": SIM_DEEPGRAM_VOICE, "encoding": "linear16", "sample_rate": str(SAMPLE_RATE), "container": "none"},
+            headers={"Authorization": f"Token {os.environ['DEEPGRAM_API_KEY']}"},
+            json={"text": text},
+        ) as r:
+            r.raise_for_status()
+            return await r.read()
     async with session.post(
         "https://api.cartesia.ai/tts/bytes",
         headers={"X-API-Key": os.environ["CARTESIA_API_KEY"], "Cartesia-Version": "2025-04-16"},

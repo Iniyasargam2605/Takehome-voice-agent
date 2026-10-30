@@ -29,6 +29,7 @@ from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.deepgram.tts import DeepgramTTSService
 from pipecat.services.groq.llm import GroqLLMService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.turns.user_start.vad_user_turn_start_strategy import VADUserTurnStartStrategy
@@ -66,6 +67,25 @@ USER_TURN_STOP_TIMEOUT = float(os.getenv("USER_TURN_STOP_TIMEOUT", str(SMART_TUR
 STT_TTFS_P99_SECS = float(os.getenv("STT_TTFS_P99_SECS", "0.8"))
 
 
+def make_tts():
+    """Cartesia by default. TTS_PROVIDER=deepgram uses Deepgram Aura-2 with the
+    STT key instead; it has no word timestamps, so an interrupted reply is kept
+    in context as whole sentences rather than only the words played."""
+    if os.getenv("TTS_PROVIDER", "cartesia").lower() == "deepgram":
+        return DeepgramTTSService(
+            api_key=os.environ["DEEPGRAM_API_KEY"],
+            settings=DeepgramTTSService.Settings(
+                voice=os.getenv("DEEPGRAM_TTS_VOICE", "aura-2-thalia-en"),
+            ),
+        )
+    return CartesiaTTSService(
+        api_key=os.environ["CARTESIA_API_KEY"],
+        settings=CartesiaTTSService.Settings(
+            voice=os.getenv("CARTESIA_VOICE_ID", "71a7ad14-091c-4e8e-a314-022ece01c121"),
+        ),
+    )
+
+
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     log = SessionLog()
 
@@ -89,12 +109,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         ),
     )
 
-    tts = CartesiaTTSService(
-        api_key=os.environ["CARTESIA_API_KEY"],
-        settings=CartesiaTTSService.Settings(
-            voice=os.getenv("CARTESIA_VOICE_ID", "71a7ad14-091c-4e8e-a314-022ece01c121"),
-        ),
-    )
+    tts = make_tts()
 
     context = LLMContext()
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
