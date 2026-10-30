@@ -28,19 +28,16 @@ from pipecat.processors.aggregators.llm_response_universal import (
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
 from pipecat.services.cartesia.tts import CartesiaTTSService
-from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.deepgram.tts import DeepgramTTSService
 from pipecat.services.groq.llm import GroqLLMService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.turns.user_start.vad_user_turn_start_strategy import VADUserTurnStartStrategy
-from pipecat.turns.user_stop.turn_analyzer_user_turn_stop_strategy import (
-    TurnAnalyzerUserTurnStopStrategy,
-)
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.workers.runner import WorkerRunner
 
 from interview import InterviewDirector
 from session_log import LatencyObserver, SessionLog
+from turn_end import DeepgramSTT, SmartTurnStopStrategy
 
 load_dotenv(override=True)
 
@@ -63,7 +60,8 @@ USER_TURN_STOP_TIMEOUT = float(os.getenv("USER_TURN_STOP_TIMEOUT", str(SMART_TUR
 # How long after the user stops we wait for the STT's final transcript before
 # ending the turn with whatever text we have. Pipecat assumes 0.35 s for
 # Deepgram; we measured 0.37-0.49 s on average, so the timer often fired
-# first and the last sentence of an answer landed in the next turn.
+# first and the last sentence of an answer landed in the next turn. Turns
+# normally end sooner than this: see turn_end.py.
 STT_TTFS_P99_SECS = float(os.getenv("STT_TTFS_P99_SECS", "0.8"))
 
 
@@ -89,10 +87,10 @@ def make_tts():
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     log = SessionLog()
 
-    stt = DeepgramSTTService(
+    stt = DeepgramSTT(
         api_key=os.environ["DEEPGRAM_API_KEY"],
         ttfs_p99_latency=STT_TTFS_P99_SECS,
-        settings=DeepgramSTTService.Settings(
+        settings=DeepgramSTT.Settings(
             model=os.getenv("DEEPGRAM_MODEL", "nova-3-general"),
             smart_format=True,
         ),
@@ -128,7 +126,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
                 # turn would interrupt the bot's reply and open an empty turn.
                 start=[VADUserTurnStartStrategy()],
                 stop=[
-                    TurnAnalyzerUserTurnStopStrategy(
+                    SmartTurnStopStrategy(
                         turn_analyzer=LocalSmartTurnAnalyzerV3(
                             params=SmartTurnParams(stop_secs=SMART_TURN_STOP_SECS)
                         )

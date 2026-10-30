@@ -10,12 +10,14 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import interview as iv
 import session_log
+import turn_end
+from deepgram.listen.v1.types import ListenV1Results
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
@@ -196,7 +198,7 @@ class TurnConfigTests(unittest.TestCase):
 
             bot = importlib.reload(bot)
         captured = {}
-        real_stt = bot.DeepgramSTTService
+        real_stt = bot.DeepgramSTT
 
         class RecordingSTT(real_stt):
             def __init__(self, **kwargs):
@@ -208,7 +210,7 @@ class TurnConfigTests(unittest.TestCase):
             raise _Captured
 
         with tempfile.TemporaryDirectory() as tmp, patch.object(bot, "LLMContextAggregatorPair", fake_pair), patch.object(
-            bot, "DeepgramSTTService", RecordingSTT
+            bot, "DeepgramSTT", RecordingSTT
         ), patch.object(
             bot, "SessionLog", lambda: session_log.SessionLog(Path(tmp))
         ):
@@ -218,11 +220,54 @@ class TurnConfigTests(unittest.TestCase):
         params = captured["params"]
         start = params.user_turn_strategies.start
         self.assertEqual([type(s).__name__ for s in start], ["VADUserTurnStartStrategy"])
+        self.assertEqual([type(s).__name__ for s in params.user_turn_strategies.stop], ["SmartTurnStopStrategy"])
         self.assertEqual(params.user_turn_stop_timeout, bot.SMART_TURN_STOP_SECS)
         self.assertGreaterEqual(params.user_turn_stop_timeout, 3.0)
         # Bug 5: the 0.35 s default STT budget was shorter than Deepgram's
         # measured finalisation time, so answers lost their last sentence.
         self.assertGreaterEqual(captured["stt"]["ttfs_p99_latency"], 0.6)
+
+
+
+def deepgram_result(transcript, is_final=True, from_finalize=True):
+    return ListenV1Results.model_construct(
+        is_final=is_final, from_finalize=from_finalize, channel={"alternatives": [{"transcript": transcript}]}
+    )
+
+
+class FinalizeTests(unittest.TestCase):
+    """Bug 6: the 0.8 s STT budget was waited out on every turn, because
+    Deepgram's reply to finalize is empty when it already sent the text."""
+
+    def test_empty_finalize_detected(self):
+        self.assertTrue(turn_end.is_empty_finalize(deepgram_result("")))
+        self.assertFalse(turn_end.is_empty_finalize(deepgram_result("the end.")))
+        self.assertFalse(turn_end.is_empty_finalize(deepgram_result("", from_finalize=False)))
+        self.assertFalse(turn_end.is_empty_finalize(deepgram_result("", is_final=False)))
+
+    def make_strategy(self, vad_stopped, text):
+        strategy = turn_end.SmartTurnStopStrategy(turn_analyzer=MagicMock())
+        strategy.trigger_user_turn_stopped = AsyncMock()
+        strategy._turn_complete = True
+        strategy._vad_stopped = vad_stopped
+        strategy._text = text
+        return strategy
+
+    def test_confirmation_ends_turn_without_waiting(self):
+        strategy = self.make_strategy(vad_stopped=True, text="payments service.")
+        asyncio.run(strategy.process_frame(turn_end.TranscriptFinalizedFrame()))
+        strategy.trigger_user_turn_stopped.assert_awaited_once()
+
+    def test_confirmation_ignored_while_user_still_talking(self):
+        # The user spoke again after the VAD stop: more text is on its way.
+        strategy = self.make_strategy(vad_stopped=False, text="payments service.")
+        asyncio.run(strategy.process_frame(turn_end.TranscriptFinalizedFrame()))
+        strategy.trigger_user_turn_stopped.assert_not_awaited()
+
+    def test_confirmation_ignored_without_text(self):
+        strategy = self.make_strategy(vad_stopped=True, text="")
+        asyncio.run(strategy.process_frame(turn_end.TranscriptFinalizedFrame()))
+        strategy.trigger_user_turn_stopped.assert_not_awaited()
 
 
 if __name__ == "__main__":
