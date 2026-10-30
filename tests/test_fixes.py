@@ -21,7 +21,10 @@ from deepgram.listen.v1.types import ListenV1Results
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
+    InterruptionFrame,
     LLMContextFrame,
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
     LLMTextFrame,
     TranscriptionFrame,
     VADUserStartedSpeakingFrame,
@@ -53,7 +56,7 @@ class DirectorTests(unittest.TestCase):
         # Bug 1: Smart Turn split one answer into three user messages, and the
         # director said the follow-up was already used.
         messages = [coach("Hi. " + Q[0]), user("So I worked on"), user("a payments service"), user("cut effort 80%")]
-        self.assertTrue(first_line(iv.current_step(messages)).startswith("You asked question 1. The candidate has just answered"))
+        self.assertIn("ask ONE short follow-up", iv.current_step(messages))
 
     def test_follow_up_answer_is_second_reply(self):
         messages = [coach(Q[0]), user("payments"), user("service"), coach("What was your role?"), user("lead")]
@@ -83,18 +86,117 @@ class DirectorTests(unittest.TestCase):
         # re-asks; the real answer should still be allowed a follow-up.
         messages = [
             coach(Q[0]), user("a"), coach(Q[1]), user("b"),
-            coach("Nice. " + Q[2]), user("Technical or business?"),
-            coach("Either works. " + Q[2]), user("we tracked lag"),
+            coach("<answer> Nice. " + Q[2]), user("Technical or business?"),
+            coach("<question> Either works. " + Q[2]), user("we tracked lag"),
         ]
-        self.assertTrue(first_line(iv.current_step(messages)).startswith("You asked question 3. The candidate has just answered"))
+        step = iv.current_step(messages)
+        self.assertTrue(first_line(step).startswith("You asked question 3."))
+        self.assertIn("ask ONE short follow-up", step)
 
-    def test_first_reply_step_mentions_reask(self):
-        messages = [coach(Q[0]), user("a")]
-        self.assertIn("ask question 1 again", iv.current_step(messages))
+    def test_step_offers_every_tag(self):
+        step = iv.current_step([coach(Q[0]), user("a")])
+        for tag in iv.TAGS:
+            self.assertIn(f"<{tag}>", step)
+        self.assertIn("Repeat your last question word for word", step)
 
     def test_feedback_after_question_4(self):
         messages = [coach(Q[0]), user("a"), coach(Q[1]), user("b"), coach(Q[2]), user("c"), coach(Q[3]), user("d"), coach("Why?"), user("e")]
         self.assertIn("closing feedback", iv.current_step(messages))
+
+
+class TaggedTurnTests(unittest.TestCase):
+    """Bug 7: "You repeat?" counted as the answer to a follow-up, and "You ask
+    the question again?" got a nudge instead of the question. The LLM now tags
+    what each turn was, so any wording of a repeat request is handled."""
+
+    def test_repeat_request_does_not_use_follow_up(self):
+        messages = [coach(Q[0]), user("mumble"), coach("<unclear> Sorry, I didn't catch that. Could you say it again?"),
+                    user("I built a payments service")]
+        self.assertEqual(iv.interview_state(messages)[:3], (1, 0, 1))
+        self.assertIn("ask ONE short follow-up", iv.current_step(messages))
+
+    def test_repeated_follow_up_then_answer_moves_on(self):
+        messages = [coach(Q[0]), user("a"), coach("<answer> What was your role?"), user("pardon?"),
+                    coach("<repeat> What was your role?"), user("I led it")]
+        self.assertEqual(iv.interview_state(messages)[:3], (1, 1, 1))
+        step = iv.current_step(messages)
+        self.assertIn("already used your one follow-up", step)
+        self.assertIn(Q[1], step)
+
+    def test_repeat_names_the_follow_up_not_the_main_question(self):
+        # Live run: told to "repeat your last question", the LLM repeated
+        # question 2 instead of its follow-up. The step now spells it out.
+        messages = [coach(Q[0]), user("a"), coach("<answer> Nice impact. What was your specific role in it?"),
+                    user("Sorry, could you say it again?")]
+        self.assertEqual(iv.last_question(messages, 1), "What was your specific role in it?")
+        self.assertIn('word for word: "What was your specific role in it?"', iv.current_step(messages))
+
+    def test_repeat_limit_moves_on(self):
+        messages = [coach(Q[0]), user("what?"), coach("<repeat> " + Q[0]), user("huh"),
+                    coach("<unclear> Sorry, could you say that again?"), user("blah")]
+        step = iv.current_step(messages)
+        self.assertTrue(step.startswith("You asked question 1 and have already repeated"))
+        self.assertIn(Q[1], step)
+
+    def test_skip_moves_on(self):
+        messages = [coach(Q[0]), user("a"), coach("<skip> That's fine. " + Q[1]), user("b")]
+        self.assertEqual(iv.interview_state(messages)[:3], (2, 0, 0))
+
+    def test_untagged_or_unknown_tag_counts_as_answer(self):
+        for reply in ("What was your role?", "<answered> What was your role?"):
+            messages = [coach(Q[0]), user("a"), coach(reply), user("b")]
+            self.assertIn("already used your one follow-up", iv.current_step(messages))
+
+    def test_tag_spellings(self):
+        self.assertEqual(iv.reply_tag("<Off-Topic> Let's get back."), "off_topic")
+        self.assertEqual(iv.reply_tag("  <repeat>Sure."), "repeat")
+        self.assertIsNone(iv.reply_tag("Sure. <repeat>"))
+
+
+class ReplyTagFilterTests(unittest.TestCase):
+    def run_filter(self, chunks, bot_spoke=True, interrupted=False):
+        director = iv.InterviewDirector()
+        f = iv.ReplyTagFilter(director)
+        out = []
+
+        async def push(frame, direction=FrameDirection.DOWNSTREAM):
+            out.append(frame)
+
+        f.push_frame = push
+
+        async def go():
+            frames = [LLMFullResponseStartFrame(), *[LLMTextFrame(c) for c in chunks], LLMFullResponseEndFrame()]
+            for frame in frames:
+                await f.process_frame(frame, FrameDirection.DOWNSTREAM)
+            if interrupted:
+                await f.process_frame(InterruptionFrame(), FrameDirection.DOWNSTREAM)
+            if bot_spoke:
+                await f.process_frame(BotStartedSpeakingFrame(), FrameDirection.UPSTREAM)
+
+        asyncio.run(go())
+        spoken = "".join(x.text for x in out if isinstance(x, LLMTextFrame))
+        return spoken, director._spoken_tag
+
+    def test_tag_split_across_tokens_is_stripped(self):
+        self.assertEqual(self.run_filter(["<rep", "eat", ">", " Sure,", " here."]), (" Sure, here.", "repeat"))
+
+    def test_untagged_reply_passes_through(self):
+        self.assertEqual(self.run_filter(["Hi there", ", welcome."]), ("Hi there, welcome.", None))
+
+    def test_unknown_tag_is_stripped_but_not_recorded(self):
+        self.assertEqual(self.run_filter(["<maybe> Okay."]), ("Okay.", None))
+
+    def test_reply_cancelled_before_audio_is_not_recorded(self):
+        self.assertEqual(self.run_filter(["<answer> Nice."], bot_spoke=False, interrupted=True)[1], None)
+
+    def test_director_restores_tag_on_spoken_reply(self):
+        director = iv.InterviewDirector()
+        director.tag_spoken("repeat")
+        messages = director._restore_tag([coach(Q[0]), user("again?"), coach(Q[0])])
+        self.assertEqual(messages[-1]["content"], "<repeat> " + Q[0])
+        self.assertEqual(messages[0]["content"], Q[0])
+        # Only once.
+        self.assertEqual(director._restore_tag(messages), messages)
 
 
 class FakeClock:

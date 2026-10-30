@@ -2,7 +2,7 @@
 
 Pipeline:
     browser mic -> SmallWebRTC in -> Deepgram STT -> user aggregator (Silero VAD + Smart Turn v3)
-    -> InterviewDirector -> Groq LLM -> Cartesia TTS -> SmallWebRTC out -> browser speaker
+    -> InterviewDirector -> Groq LLM -> ReplyTagFilter -> Cartesia TTS -> SmallWebRTC out -> browser speaker
     -> assistant aggregator
 
 Run with:  python bot.py   then open http://localhost:7860
@@ -35,7 +35,7 @@ from pipecat.turns.user_start.vad_user_turn_start_strategy import VADUserTurnSta
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.workers.runner import WorkerRunner
 
-from interview import InterviewDirector
+from interview import InterviewDirector, ReplyTagFilter
 from session_log import LatencyObserver, SessionLog
 from turn_end import DeepgramSTT, SmartTurnStopStrategy
 
@@ -137,13 +137,15 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         ),
     )
 
+    director = InterviewDirector()
     pipeline = Pipeline(
         [
             transport.input(),
             stt,
             user_aggregator,
-            InterviewDirector(),
+            director,
             llm,
+            ReplyTagFilter(director),
             tts,
             transport.output(),
             assistant_aggregator,
