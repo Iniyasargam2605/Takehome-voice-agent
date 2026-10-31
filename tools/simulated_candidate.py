@@ -9,6 +9,8 @@ Cartesia (or Deepgram when TTS_PROVIDER=deepgram). It acts out the three scenari
     B: first answer has a mid-sentence pause ("I worked on... um... <2 s> payments")
     C: on the third answer it talks over the coach's reply
 and, on its second turn, asks the coach to repeat herself instead of answering.
+On its fourth turn it stops mid-sentence for 4 s, longer than the turn-end
+fallback, and the coach should stay silent until it finishes.
 
 It also measures, on the client side, the gap from "candidate audio ended" to
 "coach audio arrived", and how fast the coach went quiet when interrupted.
@@ -229,6 +231,12 @@ async def main():
                 history[-1] = {"role": "assistant", "content": reply}
                 print(f"CANDIDATE (repeat request): {reply}")
                 pcm = await tts(http, reply)
+            elif turn == 4:
+                # Stop mid-sentence for longer than the 3 s turn-end fallback:
+                # the coach should stay silent and let them finish.
+                lead = "Actually, it is regarding"
+                print(f"CANDIDATE (mid-sentence stop): {lead} <4s pause> {reply}")
+                pcm = await tts(http, lead) + silence(4.0) + await tts(http, reply)
             elif turn == 1:
                 # Scenario B: pause mid-answer.
                 lead = "So, I worked on... um..."
