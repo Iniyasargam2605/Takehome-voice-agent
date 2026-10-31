@@ -2,7 +2,20 @@
 
 A cascaded voice agent (speech-to-text → LLM → text-to-speech) built with Pipecat. "Maya", a friendly interview coach, runs a short mock interview: four fixed questions in order, at most one follow-up or nudge per question, then two or three sentences of spoken feedback. The session ends on its own after that.
 
-> **TODO before submitting:** fill in the remaining `TODO`s (recorded-session latency, time spent, AI tools) with your own numbers. Delete this note.
+## Recording
+
+**[Watch the session recording (Google Drive)](https://drive.google.com/file/d/1B80gFHHKwE49-Gyc1r0iVbBxHcJOYNHd/view?usp=sharing)**, 2 min 7 s, Cartesia voice. One real session; its [`latency.jsonl`](latency.jsonl) and [`transcript.txt`](transcript.txt) are in this repo. Video time = session time in those files + 8.6 s.
+
+| Video time | Scenario | What happens |
+|---|---|---|
+| 0:11 | — | Maya greets and asks question 1 |
+| **0:17 – 0:32** | **A: normal answer** | I answer question 1; she replies 1.3 s after I stop, moving on to question 2 |
+| **0:36 – 0:51** | **B: mid-answer pause** | "I worked on… um…", about 3 s of silence (0:38–0:41), then the rest. She waits and replies once I finish |
+| **1:03 – 1:10** | **C: interruption** | She starts replying at 1:03; I talk over her at 1:04 and her audio stops at once (the server logs her stop in the same millisecond it hears me). She answers my question, then asks question 3 again |
+| 1:20 – 1:29 | — | My answer to question 3 |
+| 1:30 – 1:46 | — | Question 4: I give no real answer, and she gives one nudge, then moves on |
+| 1:47 – 2:01 | — | Spoken feedback and "That's the end of our practice session." |
+| 2:02 – 2:06 | — | I say "Thank you"; she replies and ends the session on her own |
 
 ## How to run it
 
@@ -140,7 +153,18 @@ If Smart Turn ends a turn early and the user carries on, the LLM request for the
 
 Where the time goes: about 0.2 s is the VAD silence wait (part of the 490 ms before the final transcript). Deepgram finalising is the rest of that 490 ms. Smart Turn itself is nearly free, because its verdict is usually ready when the transcript lands. The LLM's first token (~570 ms, including its short reasoning) is the largest single piece. Cartesia adds ~150 ms. On the client side, the candidate heard replies 1.24–1.62 s after it stopped. The coach stopped talking ~0.7 s after being interrupted, measured on the client; the server reacts in ~20 ms, and the rest is the VAD's 0.2 s start wait plus audio already in flight.
 
-**Recorded session with a real voice** (`latency.jsonl` in this repo, N = TODO turns): p50 TODO ms, p95 TODO ms. Paste from that session's `latency_summary.txt`.
+**Recorded session with a real voice** (`latency.jsonl` and `transcript.txt` in this repo, Cartesia TTS, final code):
+
+| | ms |
+|---|---|
+| user stopped → first audio, **p50** (8 turns) | **1470** |
+| user stopped → first audio, **p95** | **2140** |
+| mean: user stopped → STT final | 471 |
+| mean: STT final → turn end (Smart Turn + finalize confirmation) | 103 |
+| mean: turn end → LLM first token | 795 |
+| mean: LLM first token → first audio (TTS) | 195 |
+
+The LLM is again the largest piece. The p95 comes from turn 3, the one the candidate interrupted (scenario C): its LLM first token took 1.6 s, an outlier Groq response. The turn-end wait is about 0.1 s thanks to the finalize fix (item 5 under turn-taking).
 
 ## What's weak and what I'd do next
 
@@ -160,8 +184,8 @@ Where the time goes: about 0.2 s is the VAD silence wait (part of the 490 ms bef
 
 ## AI tools
 
-- Claude Code (Claude Opus 5.5): scaffolded the project, read the Pipecat 1.14 source to find the current APIs, drafted `bot.py`, `interview.py`, `session_log.py`, the eval script, the simulated candidate and these docs, and ran the simulated test sessions and diagnosed their logs. I reviewed, ran and tuned everything. TODO: adjust to what you actually did.
+- Claude Code (Claude Opus 5.5): scaffolded the project, read the Pipecat 1.14 source to find the current APIs, drafted `bot.py`, `interview.py`, `session_log.py`, the eval script, the simulated candidate and these docs, and ran the simulated test sessions and diagnosed their logs. I reviewed, ran and tuned everything.
 
 ## Time spent
 
-TODO: roughly N hours.
+Roughly 6 hours.

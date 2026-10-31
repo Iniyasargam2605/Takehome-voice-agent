@@ -1,0 +1,18 @@
+[   7.39s] Coach: Hi there, this is a four question practice interview. Tell me about a project you're proud of.
+[  22.25s] User: I built a payment reconciliation service at a fintech startup. It matched daily bank settlements files against our internal ledger flagged mismatches for the finance team. It cut manual checking from about three hours a day to fifteen minutes.
+[  26.41s] Coach: That sounds impressive. What was the hardest technical problem in it?
+[  41.70s] User: Worked on handling that arrived out of order. Some banks and corrections are delayed. So I built a matching step that could recheck all the records without counting them twice.
+[  46.59s] Coach: How many records did you typically process each day? How did you know it was working well?
+[  52.93s] User: Track the match sheet and the number of manual exceptions every day.
+[  55.93s] Coach: What reduction in manual [interrupted by user]
+[  60.03s] User: Sorry. Quick question. I focus on the technical side or on the business side?
+[  66.27s] Coach: You can focus on whichever adds the most value, often a blend of both. How did you know it was working well?
+[  78.64s] User: Don't... I tests with real bank files from the start, and I'd move matching into a streaming service so it runs in real time
+[  80.34s] User: instead of once in a night.
+[  85.37s] Coach: Nice, real‑time testing shows it works. What would you do differently now?
+[  88.73s] User: Probably nothing.
+[  92.73s] Coach: Is there any part of the architecture you’d revisit if you could start over?
+[  97.85s] User: I don't think so.
+[ 111.61s] Coach: You showed confidence, saying the system works well with real bank files and streaming. One area to improve is giving a concrete example, like how many records you processed or the exact time saved. That's the end of our practice session.
+[ 114.23s] User: Thank you.
+[ 117.11s] Coach: You're welcome! That's the end of our practice session.
