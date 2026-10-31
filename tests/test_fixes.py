@@ -131,6 +131,19 @@ class TaggedTurnTests(unittest.TestCase):
         self.assertEqual(iv.last_question(messages, 1), "What was your specific role in it?")
         self.assertIn('word for word: "What was your specific role in it?"', iv.current_step(messages))
 
+    def test_incomplete_offered_once_in_a_row(self):
+        # Manual session: "About" and "Actually, it is regarding" were tagged
+        # <repeat> and the coach re-asked mid-answer. Now the LLM can choose to
+        # stay silent, but never twice in a row.
+        messages = [coach(Q[0]), user("Actually, it is regarding")]
+        self.assertIn("<incomplete>", iv.current_step(messages))
+        self.assertIn("stay silent", iv.current_step(messages))
+        self.assertNotIn("<incomplete>", iv.current_step(messages, allow_wait=False))
+
+    def test_repeat_needs_an_explicit_request(self):
+        step = iv.current_step([coach(Q[0]), user("The invoice.")])
+        self.assertIn("A short or partial answer is not a repeat request", step)
+
     def test_repeat_limit_moves_on(self):
         messages = [coach(Q[0]), user("what?"), coach("<repeat> " + Q[0]), user("huh"),
                     coach("<unclear> Sorry, could you say that again?"), user("blah")]
@@ -188,6 +201,73 @@ class ReplyTagFilterTests(unittest.TestCase):
 
     def test_reply_cancelled_before_audio_is_not_recorded(self):
         self.assertEqual(self.run_filter(["<answer> Nice."], bot_spoke=False, interrupted=True)[1], None)
+
+    def test_incomplete_reply_is_silent(self):
+        director = MagicMock()
+        f = iv.ReplyTagFilter(director)
+        out = []
+
+        async def push(frame, direction=FrameDirection.DOWNSTREAM):
+            out.append(frame)
+
+        f.push_frame = push
+
+        async def go():
+            for chunks in (["<incomp", "lete>", " Go on."], ["<answer> Got it."]):
+                frames = [LLMFullResponseStartFrame(), *[LLMTextFrame(c) for c in chunks], LLMFullResponseEndFrame()]
+                for frame in frames:
+                    await f.process_frame(frame, FrameDirection.DOWNSTREAM)
+
+        asyncio.run(go())
+        spoken = [x.text for x in out if isinstance(x, LLMTextFrame)]
+        # Nothing from the incomplete reply reaches TTS; the next reply does.
+        self.assertEqual(spoken, ["Got it."])
+        director.wait_silently.assert_called_once()
+
+    def test_repeat_speaks_the_exact_last_question(self):
+        # Live run: tagged <repeat>, but the LLM said question 2 instead of
+        # its follow-up. Code now supplies the words.
+        director = MagicMock(repeat_text="How many settlement files did you handle each day?")
+        f = iv.ReplyTagFilter(director)
+        out = []
+
+        async def push(frame, direction=FrameDirection.DOWNSTREAM):
+            out.append(frame)
+
+        f.push_frame = push
+
+        async def go():
+            chunks = ["<repeat>", " What was the hardest", " technical problem in it?"]
+            frames = [LLMFullResponseStartFrame(), *[LLMTextFrame(c) for c in chunks], LLMFullResponseEndFrame()]
+            for frame in frames:
+                await f.process_frame(frame, FrameDirection.DOWNSTREAM)
+            await f.process_frame(BotStartedSpeakingFrame(), FrameDirection.UPSTREAM)
+
+        asyncio.run(go())
+        self.assertEqual([x.text for x in out if isinstance(x, LLMTextFrame)], [director.repeat_text])
+        director.tag_spoken.assert_called_once_with("repeat")
+
+    def test_director_sets_repeat_text(self):
+        director = iv.InterviewDirector()
+        context = LLMContext([coach(Q[0]), user("a"), coach("<answer> Nice. What was your role?"), user("pardon?")])
+        director._update_system_prompt(context)
+        self.assertEqual(director.repeat_text, "What was your role?")
+
+    def test_director_does_not_wait_twice_in_a_row(self):
+        director = iv.InterviewDirector()
+        director.create_task = MagicMock()
+        director.wait_silently()
+        context = LLMContext([coach(Q[0]), user("so I worked on")])
+        director._update_system_prompt(context)
+        self.assertNotIn("<incomplete>", context.get_messages()[0]["content"])
+        # The wait applies to one reply only.
+        director._update_system_prompt(context)
+        self.assertIn("<incomplete>", context.get_messages()[0]["content"])
+
+    def test_quiet_after_wait_gets_gentle_invite(self):
+        step = iv.current_step([coach(Q[0]), user("Actually, it is regarding")], allow_wait=False, after_wait=True)
+        self.assertEqual(step, iv.STEP_AFTER_WAIT)
+        self.assertIn("<unclear>", step)
 
     def test_director_restores_tag_on_spoken_reply(self):
         director = iv.InterviewDirector()

@@ -61,10 +61,14 @@ CLOSING_LINE = "That's the end of our practice session."
 # What the candidate's last turn was, as tagged by the LLM. Only these use up
 # a question's one follow-up or nudge; the rest are turns about the question.
 ANSWER_TAGS = {"answer", "skip"}
-TAGS = ANSWER_TAGS | {"repeat", "question", "unclear", "off_topic"}
+TAGS = ANSWER_TAGS | {"repeat", "question", "unclear", "off_topic", "incomplete"}
 # After this many repeats or clarifications on one question, move on anyway,
 # so a bad line or a confused candidate can't loop forever.
 MAX_REPEATS = 2
+# An <incomplete> reply is dropped and the agent says nothing, so the
+# candidate can finish their sentence. If they stay quiet this long, reply
+# anyway (and don't wait twice in a row), so a wrong guess never means dead air.
+INCOMPLETE_WAIT_SECS = 3.0
 # Any leading tag, known or not, so an invented tag is never spoken either.
 TAG_RE = re.compile(r"^\s*<([a-z_\- ]{1,20})>\s*", re.IGNORECASE)
 
@@ -106,9 +110,10 @@ STEP_GREETING = (
 STEP_QUESTION = (
     "You asked question {n}. First decide what the candidate's last message was. Start your reply with "
     "exactly one of these tags (it is removed before speaking), then do what it says:\n"
-    "<answer> They answered, even partly or vaguely, or said they don't know. {answer_action}\n"
-    "<repeat> They asked you to repeat or say that again, or didn't hear you. Repeat your last question "
-    'word for word: "{last_q}"\n'
+    "<answer> They answered, even briefly, partly or vaguely, or said they don't know. {answer_action}\n"
+    "{incomplete}"
+    "<repeat> They explicitly asked you to repeat or say that again, or said they didn't hear you. A short "
+    'or partial answer is not a repeat request. Repeat your last question word for word: "{last_q}"\n'
     "<question> They asked you something else. Answer it in one sentence, then repeat your last question "
     'word for word: "{last_q}"\n'
     "<unclear> Their words make no sense here, probably a speech recognition error. Say you didn't quite "
@@ -117,6 +122,18 @@ STEP_QUESTION = (
     'last question: "{last_q}"\n'
     "<skip> They ask to skip this question. Say that's fine, then {next_action}\n"
     "Your reply must start with the tag."
+)
+
+INCOMPLETE_BRANCH = (
+    "<incomplete> Their message clearly stops mid-sentence, as if they paused to think, for example it ends "
+    'with "about", "regarding", "so", "and" or "um". Write only the tag and nothing else: you stay silent '
+    "and let them finish.\n"
+)
+
+STEP_AFTER_WAIT = (
+    "The candidate stopped mid-sentence and has been quiet for a few seconds. Start your reply with "
+    '<unclear>, then gently invite them to finish their thought in one short sentence, for example "Take '
+    'your time, go on."'
 )
 
 ANSWER_FIRST = (
@@ -212,14 +229,21 @@ def interview_state(messages: list[dict]) -> tuple[int, int, int, bool]:
     return question, answers, repeats, feedback_given
 
 
-def current_step(messages: list[dict]) -> str:
-    """Work out the instruction for the next agent reply from the conversation."""
+def current_step(messages: list[dict], allow_wait: bool = True, after_wait: bool = False) -> str:
+    """Work out the instruction for the next agent reply from the conversation.
+
+    allow_wait: offer the silent <incomplete> branch. False right after a
+    silent wait, so the agent never waits twice in a row.
+    after_wait: the candidate stayed quiet through a silent wait.
+    """
     question, answers, repeats, feedback_given = interview_state(messages)
 
     if feedback_given:
         return STEP_AFTER_FEEDBACK
     if question == 0:
         return STEP_GREETING
+    if after_wait:
+        return STEP_AFTER_WAIT
 
     if question < len(QUESTIONS):
         next_action = NEXT_QUESTION.format(n=question + 1, q=QUESTIONS[question])
@@ -230,7 +254,11 @@ def current_step(messages: list[dict]) -> str:
         return STEP_REPEAT_LIMIT.format(n=question, next_action=next_action)
     answer_action = (ANSWER_FIRST if answers == 0 else ANSWER_SECOND).format(next_action=next_action)
     return STEP_QUESTION.format(
-        n=question, answer_action=answer_action, next_action=next_action, last_q=last_question(messages, question)
+        n=question,
+        answer_action=answer_action,
+        incomplete=INCOMPLETE_BRANCH if allow_wait else "",
+        next_action=next_action,
+        last_q=last_question(messages, question),
     )
 
 
@@ -259,20 +287,35 @@ class InterviewDirector(FrameProcessor):
     - On every ``LLMContextFrame`` it puts the tag of the last spoken reply
       back onto that reply in the context, then rewrites the system message
       with the current step, so the LLM always knows what it is allowed to do.
+    - After a silent <incomplete> wait, it replies anyway if the candidate
+      stays quiet for ``INCOMPLETE_WAIT_SECS``, and doesn't offer the wait
+      again on the next reply.
     - After the closing line has been spoken (and not interrupted), it ends
       the session.
     """
 
-    def __init__(self, end_delay_secs: float = 1.5, **kwargs):
+    def __init__(self, end_delay_secs: float = 1.5, wait_secs: float = INCOMPLETE_WAIT_SECS, **kwargs):
         super().__init__(**kwargs)
         self._context: LLMContext | None = None
         self._end_delay_secs = end_delay_secs
         self._end_task: asyncio.Task | None = None
         self._spoken_tag: str | None = None
+        self._wait_secs = wait_secs
+        self._waited = False
+        self._wait_task: asyncio.Task | None = None
+        # What a <repeat> reply says, word for word, set before each LLM call.
+        self.repeat_text: str | None = None
 
     def tag_spoken(self, tag: str):
         """Called by ``ReplyTagFilter`` when a tagged reply starts playing."""
         self._spoken_tag = tag
+
+    def wait_silently(self):
+        """Called by ``ReplyTagFilter`` when it dropped an <incomplete> reply."""
+        logger.info("Candidate stopped mid-sentence, waiting silently")
+        self._waited = True
+        if not self._wait_task:
+            self._wait_task = self.create_task(self._reply_after_wait())
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -282,6 +325,9 @@ class InterviewDirector(FrameProcessor):
             self._update_system_prompt(frame.context)
         elif isinstance(frame, (InterruptionFrame, UserStartedSpeakingFrame, BotStartedSpeakingFrame)):
             await self._cancel_end()
+            if isinstance(frame, UserStartedSpeakingFrame):
+                # They're finishing their sentence: no need to prompt them.
+                await self._cancel_wait()
         elif isinstance(frame, BotStoppedSpeakingFrame) and self._closing_line_spoken():
             # Wait a moment: BotStoppedSpeaking can fire on a short gap between
             # sentences, and the user may still want to say something.
@@ -290,9 +336,12 @@ class InterviewDirector(FrameProcessor):
 
         await self.push_frame(frame, direction)
 
-    def _update_system_prompt(self, context: LLMContext):
+    def _update_system_prompt(self, context: LLMContext, after_wait: bool = False):
         messages = self._restore_tag(context.get_messages())
-        step = current_step(messages)
+        step = current_step(messages, allow_wait=not self._waited, after_wait=after_wait)
+        question = interview_state(messages)[0]
+        self.repeat_text = last_question(messages, question) if question else None
+        self._waited = False
         logger.info(f"Interview step: {step.splitlines()[0][:120]}")
         prompt = {"role": "system", "content": build_system_prompt(step)}
         if messages and messages[0].get("role") == "system":
@@ -339,6 +388,19 @@ class InterviewDirector(FrameProcessor):
             await self.cancel_task(self._end_task)
             self._end_task = None
 
+    async def _reply_after_wait(self):
+        await asyncio.sleep(self._wait_secs)
+        self._wait_task = None
+        if self._context:
+            logger.info("Candidate stayed quiet after the wait, replying")
+            self._update_system_prompt(self._context, after_wait=True)
+            await self.push_frame(LLMContextFrame(self._context))
+
+    async def _cancel_wait(self):
+        if self._wait_task:
+            await self.cancel_task(self._wait_task)
+            self._wait_task = None
+
 
 class ReplyTagFilter(FrameProcessor):
     """Sits between the LLM and TTS and removes the tag from each reply.
@@ -347,6 +409,9 @@ class ReplyTagFilter(FrameProcessor):
     (a few tokens), so streaming to TTS is unaffected. Hands the tag to the
     director when the reply starts playing; a reply cancelled before any audio
     played never happened as far as the interview state is concerned.
+
+    An <incomplete> reply is dropped whole, so the agent stays silent and the
+    candidate can finish their sentence.
     """
 
     def __init__(self, director: InterviewDirector, **kwargs):
@@ -354,13 +419,16 @@ class ReplyTagFilter(FrameProcessor):
         self._director = director
         self._buffer = ""
         self._scanning = False
+        self._silent = False
         self._tag: str | None = None
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, LLMFullResponseStartFrame):
-            self._buffer, self._scanning, self._tag = "", True, None
+            self._buffer, self._scanning, self._silent, self._tag = "", True, False, None
+        elif isinstance(frame, LLMTextFrame) and self._silent:
+            return
         elif isinstance(frame, LLMTextFrame) and self._scanning:
             await self._scan(frame.text)
             return
@@ -370,7 +438,7 @@ class ReplyTagFilter(FrameProcessor):
             self._director.tag_spoken(self._tag)
             self._tag = None
         elif isinstance(frame, InterruptionFrame):
-            self._buffer, self._scanning, self._tag = "", False, None
+            self._buffer, self._scanning, self._silent, self._tag = "", False, False, None
 
         await self.push_frame(frame, direction)
 
@@ -383,6 +451,16 @@ class ReplyTagFilter(FrameProcessor):
         if m:
             self._tag = _known_tag(m.group(1))
             logger.info(f"Reply tag: {m.group(1)}")
+            if self._tag == "incomplete":
+                self._buffer, self._scanning, self._silent, self._tag = "", False, True, None
+                self._director.wait_silently()
+                return
+            if self._tag == "repeat" and self._director.repeat_text:
+                # Repeating is deterministic, so code says it: the LLM once
+                # tagged <repeat> and then asked the main question instead.
+                self._buffer, self._scanning, self._silent = "", False, True
+                await self.push_frame(LLMTextFrame(self._director.repeat_text))
+                return
             self._buffer = head[m.end():]
             await self._flush()
         elif not head.startswith("<") or ">" in head or len(head) > 24:
