@@ -29,7 +29,7 @@ Each session writes to `sessions/<timestamp>/`: `latency.jsonl`, `transcript.txt
 
 **Automated test session:** with the bot running, `python tools/simulated_candidate.py` connects over WebRTC like a browser. It acts as a candidate (answers from Groq, voice from Cartesia) and plays out scenarios A, B and C, measuring reply gaps and interruption stop time on the client side.
 
-**Tests:** `python -m unittest discover -s tests -v` runs 27 offline regression tests for the bugs below and the intent-tag state machine (no API keys or network needed). After a simulated session, `python tests/check_session.py` checks the newest `sessions/` folder and `bot.log` against each fix: questions in order, follow-ups, scenarios B and C, no phantom turns, latency rows, and that the coach never replied mid-answer.
+**Tests:** `python -m unittest discover -s tests -v` runs 34 offline regression tests for the bugs below and the intent-tag state machine (no API keys or network needed). After a simulated session, `python tests/check_session.py` checks the newest `sessions/` folder and `bot.log` against each fix: questions in order, follow-ups, scenarios B and C, no phantom turns, latency rows, and that the coach never replied mid-answer.
 
 **Windows note:** Pipecat has some long file paths. If you get `ModuleNotFoundError` for a module that exists on disk, your project or venv path is over Windows' 260-character limit. Move the venv somewhere short such as `C:\venvs\trainertwin`.
 
@@ -66,8 +66,10 @@ Transport: Pipecat's `SmallWebRTCTransport` with its prebuilt browser UI, run by
 Custom pieces:
 
 - **`interview.py`: the LLM classifies, Python enforces.**
-  - **The LLM** starts each reply with a tag saying what the candidate's turn was: `answer`, `repeat`, `question`, `unclear`, `off_topic` or `skip`. This handles any wording of "can you repeat that?", which a keyword list can't. It comes in the same call as the reply, so it adds no round trip.
-  - **`ReplyTagFilter`**, between the LLM and TTS, strips the tag so it's never spoken. Once the reply starts playing, it hands the tag to the director.
+  - **The LLM** starts each reply with a tag saying what the candidate's turn was: `answer`, `incomplete`, `repeat`, `question`, `unclear`, `off_topic` or `skip`. This handles any wording of "can you repeat that?", which a keyword list can't. It comes in the same call as the reply, so it adds no round trip.
+  - **`ReplyTagFilter`**, between the LLM and TTS, strips the tag so it's never spoken. Once the reply starts playing, it hands the tag to the director. Two tags are acted on in code:
+    - `<incomplete>` (a sentence cut off mid-thought): the whole reply is dropped and the agent stays silent, which is what the brief asks for on a mid-answer pause. If the candidate is still quiet 3 s later, she gently invites them to go on, and she never waits twice in a row.
+    - `<repeat>`: code speaks the exact last question itself.
   - **`InterviewDirector`**, before the LLM, writes that tag back onto the reply in the context. It then derives the state from the agent's messages in plain Python:
     - which of the four questions was last asked, matched on the end of the question's exact wording, so a question cut off by an interruption doesn't count
     - whether that question's one follow-up or nudge has been used (only `answer`/`skip` replies count)

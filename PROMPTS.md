@@ -46,8 +46,8 @@ The session is starting. Greet the candidate in one short sentence, say this is 
 **On question N** (the LLM tags what the candidate's turn was, then follows that branch):
 ```text
 You asked question {n}. First decide what the candidate's last message was. Start your reply with exactly one of these tags (it is removed before speaking), then do what it says:
-<answer> They answered, even partly or vaguely, or said they don't know. {answer_action}
-<repeat> They asked you to repeat or say that again, or didn't hear you. Repeat your last question word for word: "{last_q}"
+<answer> They answered, even briefly, partly or vaguely, or said they don't know. {answer_action}
+{incomplete}<repeat> They explicitly asked you to repeat or say that again, or said they didn't hear you. A short or partial answer is not a repeat request. Repeat your last question word for word: "{last_q}"
 <question> They asked you something else. Answer it in one sentence, then repeat your last question word for word: "{last_q}"
 <unclear> Their words make no sense here, probably a speech recognition error. Say you didn't quite catch that and ask them to say it again.
 <off_topic> It has nothing to do with the interview. Steer back in one sentence, then repeat your last question: "{last_q}"
@@ -55,7 +55,17 @@ You asked question {n}. First decide what the candidate's last message was. Star
 Your reply must start with the tag.
 ```
 
-`{last_q}` is the last question the agent actually asked (it may be a follow-up), pulled from its last message by code.
+`{last_q}` is the last question the agent actually asked (it may be a follow-up), pulled from its last message by code. For a `<repeat>` reply, code speaks `{last_q}` itself and drops the LLM's text, because repeating is deterministic.
+
+`{incomplete}` is this line, left out right after a silent wait so the agent never waits twice in a row:
+```text
+<incomplete> Their message clearly stops mid-sentence, as if they paused to think, for example it ends with "about", "regarding", "so", "and" or "um". Write only the tag and nothing else: you stay silent and let them finish.
+```
+
+**After a silent wait** (the candidate stayed quiet for 3 s after an `<incomplete>`):
+```text
+The candidate stopped mid-sentence and has been quiet for a few seconds. Start your reply with <unclear>, then gently invite them to finish their thought in one short sentence, for example "Take your time, go on."
+```
 
 `{answer_action}` while the question's follow-up or nudge is unused:
 ```text
@@ -89,8 +99,8 @@ The interview is over and you already gave feedback. Reply in one sentence to wh
 
 The decision is split between code and the LLM:
 
-- **The LLM decides what the candidate's turn was.** It starts each reply with a tag: `answer`, `repeat`, `question`, `unclear`, `off_topic` or `skip`. This works for any wording ("say that again", "sorry, what?", "pardon?"), which a keyword list can't. The decision comes in the same call as the reply, so there is no extra round trip. Pipecat's own turn-completion markers use the same trick.
-- **`ReplyTagFilter` strips the tag before TTS** and, once the reply starts playing, hands the tag to the director. The director writes it back onto that reply in the context. A reply cancelled before any audio played gets no tag.
+- **The LLM decides what the candidate's turn was.** It starts each reply with a tag: `answer`, `incomplete`, `repeat`, `question`, `unclear`, `off_topic` or `skip`. This works for any wording ("say that again", "sorry, what?", "pardon?"), which a keyword list can't. The decision comes in the same call as the reply, so there is no extra round trip. Pipecat's own turn-completion markers use the same trick.
+- **`ReplyTagFilter` strips the tag before TTS** and, once the reply starts playing, hands the tag to the director. The director writes it back onto that reply in the context. A reply cancelled before any audio played gets no tag. Two tags are acted on in code: an `<incomplete>` reply is dropped so the agent stays silent, and for `<repeat>` code speaks the exact last question in place of the LLM's text.
 - **Code decides where we are and what is allowed.** `interview_state()` reads only the agent's messages:
   - The last agent message containing the end of a question's exact wording ("…do differently now") sets the current question. A question cut off by an interruption doesn't count.
   - Agent replies since then tagged `answer` or `skip` count as the follow-up or nudge used. An untagged reply counts as one, which was the behaviour before tags.
@@ -179,6 +189,20 @@ A keyword list ("repeat", "again", "pardon") can't cover every wording, so the L
 [116.35s] Coach: That's a solid scale. What was the hardest technical problem in it?
 ```
 The repeat request didn't use up the follow-up. After the real answer, the coach moved on because the follow-up had been used. 6 of 7 replies carried a tag. The LLM also invented `<greeting>` once; the filter strips unknown tags without recording them.
+
+**v6: stay silent on a half-finished sentence; code speaks repeats.**
+What went wrong in v5 (a manual session): pausing mid-sentence ended the turn, the LLM tagged the fragment `<repeat>`, and the coach re-asked mid-answer. The brief says the agent "should wait" on a mid-answer pause:
+```text
+[ 70.15s] User: About
+[ 70.87s] Coach: How long did it take you to get the metrics working? [interrupted by user]
+[ 71.80s] User: day or so?
+```
+Three changes:
+- A new `<incomplete>` tag. Its reply is dropped before TTS, so the agent stays silent and keeps listening.
+- If the candidate stays quiet for 3 s after an `<incomplete>`, the agent gently invites them to go on. The silent branch isn't offered twice in a row, so a wrong guess never means dead air.
+- `<repeat>` now needs an explicit request.
+
+A simulated run also caught the LLM tagging `<repeat>` and then asking question 2 instead of its follow-up, so code now speaks the repeated question itself. Result: with "Actually it is regarding" followed by a 4 s pause, the coach stayed silent and the candidate finished the answer; a repeat request got the exact last question. In that run, p50 was 1.64 s.
 
 ## Known failure cases
 
